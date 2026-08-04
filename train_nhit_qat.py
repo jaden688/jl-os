@@ -84,12 +84,31 @@ def fake_quant_taps(taps: torch.Tensor, bits: int) -> torch.Tensor:
     return q * step
 
 
-def fake_quant_act(x: torch.Tensor) -> torch.Tensor:
-    """INT8 activations with saturation, matching sat8() in nhit.c."""
-    peak = x.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
-    step = peak / 127.0
-    q = RoundSTE.apply(x / step).clamp(-128, 127)
-    return q * step
+def fake_quant_act(x: torch.Tensor, scale: torch.Tensor | None = None):
+    """INT8 activations with saturation, matching sat8() in nhit.c.
+
+    `scale` is a FIXED per-layer step. Passing None falls back to per-sample
+    dynamic scaling, which is what the previous version did -- and which the
+    kernel cannot do. The kernel applies one arithmetic right shift per layer,
+    chosen once at calibration, identically for every input. Training against a
+    per-sample rescaler optimises for a machine that does not exist, and that
+    mismatch is where QAT 0.2168 collapsed to an integer path of 0.1583.
+    """
+    if scale is None:
+        scale = x.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / 127.0
+    q = RoundSTE.apply(x / scale).clamp(-128, 127)
+    return q * scale
+
+
+def pow2_snap(x: torch.Tensor) -> torch.Tensor:
+    """Round a scale to the nearest power of two, STE for the gradient.
+
+    The kernel rescales with `>> shift`, so only powers of two are reachable.
+    Letting training use an arbitrary float scale would again be optimising
+    against something the hardware cannot express.
+    """
+    e = RoundSTE.apply(torch.log2(x.clamp_min(1e-8)))
+    return torch.pow(2.0, e)
 
 
 def circular_conv(x, taps):
@@ -104,19 +123,43 @@ class QatNhit(nn.Module):
         self.embed = nn.Embedding(vocab, N)
         self.taps = nn.Parameter(torch.randn(DEPTH, N) * 0.3)
         self.head = nn.Linear(N, vocab)
+        # One fixed activation scale per layer, tracked as a running estimate
+        # the way BatchNorm tracks statistics. Snapped to a power of two at use,
+        # because the kernel can only shift.
+        self.register_buffer("act_scale", torch.ones(DEPTH + 1))
+        self.register_buffer("scale_ready", torch.zeros(1))
+
+    def _track(self, slot: int, x: torch.Tensor) -> torch.Tensor:
+        """Update the running scale for this slot and return the fixed one."""
+        if self.training:
+            # 99th percentile, NOT the max. A single global max puts typical
+            # samples far below full scale, so they quantise into a handful of
+            # levels. The export path already calibrates on p99, so using amax
+            # here would keep training and the kernel disagreeing.
+            observed = torch.quantile(x.abs().flatten().float(), 0.99).detach() / 110.0
+            if self.scale_ready.item() == 0:
+                self.act_scale[slot] = observed.clamp_min(1e-8)
+            else:
+                self.act_scale[slot].mul_(0.99).add_(0.01 * observed.clamp_min(1e-8))
+        return pow2_snap(self.act_scale[slot])
 
     def forward(self, idx):
         e = self.embed(idx)
         # Position as rotation on the ring, matching to_int8_ring().
         x = torch.stack([torch.roll(e[:, p], shifts=p, dims=-1)
                          for p in range(e.shape[1])], dim=1).sum(dim=1)
-        x = fake_quant_act(x)                       # the INT8 input the kernel gets
+        # The input IS per-sample normalised in the kernel (to_int8_ring scales
+        # by that vector's own peak), so dynamic scaling is correct here only.
+        x = fake_quant_act(x)
         for d in range(DEPTH):
             t = fake_quant_taps(self.taps[d].unsqueeze(0), self.bits)
             x = circular_conv(x, t)
-            x = fake_quant_act(x)                   # INT8 after the shift rescale
+            # Fixed power-of-two rescale -- exactly one `>> shift` per layer.
+            x = fake_quant_act(x, self._track(d, x))
             if d + 1 < DEPTH:
                 x = F.relu(x)
+        if self.training:
+            self.scale_ready.fill_(1)
         return self.head(x)
 
 
