@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.o
+*.bin
+*.flat
+*.iso
+vgadump.bin
+serial.log
+.known_good/
+__pycache__/
