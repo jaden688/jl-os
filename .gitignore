@@ -18,3 +18,4 @@ mh_g16_snapshot.pt
 test_lm_host
 boot_serial.log
 corpus_frozen.txt
+nhit_weights_mh.h

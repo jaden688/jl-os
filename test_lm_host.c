@@ -25,16 +25,37 @@
 #include <string.h>
 
 #include "jl_lm.h"
-#include "nhit_weights_mh.h"
+
+/* Read a whole file, or NULL. */
+static uint8_t *slurp(const char *path, long *len_out) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    uint8_t *p = malloc((size_t)n + 1);
+    if (!p || fread(p, 1, (size_t)n, f) != (size_t)n) { fclose(f); return NULL; }
+    p[n] = 0;
+    fclose(f);
+    *len_out = n;
+    return p;
+}
 
 int main(int argc, char **argv) {
     const char *path = (argc > 1) ? argv[1] : "lm_valset.bin";
+    const char *model = (argc > 2) ? argv[2] : "core.nhit";
 
-    if (!jl_lm_selftest()) {
-        fprintf(stderr, "FAIL: jl_lm_selftest -- weight header disagrees with "
-                        "nhit.h (NHIT_N, vocab or table sizes)\n");
+    /* The SAME blob the kernel reads off PEWTER-FS, through the SAME loader.
+     * Scoring a differently-sourced copy of the weights would measure a model
+     * the kernel does not run. */
+    long mlen = 0;
+    uint8_t *blob = slurp(model, &mlen);
+    if (!blob) { fprintf(stderr, "FAIL: cannot open model %s\n", model); return 1; }
+    if (!jl_lm_load(blob, (uint32_t)mlen)) {
+        fprintf(stderr, "FAIL: jl_lm_load rejected %s (%ld bytes)\n", model, mlen);
         return 1;
     }
+    printf("model               %s (%ld bytes)\n", model, mlen);
 
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "FAIL: cannot open %s\n", path); return 1; }
@@ -69,8 +90,8 @@ int main(int argc, char **argv) {
     double base = (double)major_correct / (double)total;
 
     printf("windows scored      %ld\n", total);
-    printf("model shape         groups=%d heads=%d depth=%d N=%d vocab=%d\n",
-           MH_GROUPS, MH_HEADS, MH_DEPTH, NHIT_N, MH_VOCAB);
+    printf("model shape         groups=%u heads=%u depth=%u N=%d vocab=%u\n",
+           jl_lm_groups(), jl_lm_heads(), jl_lm_depth(), NHIT_N, jl_lm_vocab());
     printf("taps                %u\n", jl_lm_taps());
     printf("MACs per inference  %u\n", jl_lm_macs());
     printf("\n");
@@ -86,7 +107,7 @@ int main(int argc, char **argv) {
         unsigned char p = (unsigned char)jl_lm_predict(&text[i], 0);
         if (!seen[p]) { seen[p] = 1; distinct++; }
     }
-    printf("distinct predictions %d of %d vocab %s\n", distinct, MH_VOCAB,
+    printf("distinct predictions %d of %u vocab %s\n", distinct, jl_lm_vocab(),
            distinct <= 2 ? "  <-- COLLAPSED, accuracy is not meaningful" : "");
 
     /* Show the model actually continuing text, since an accuracy figure alone

@@ -244,21 +244,37 @@ void kmain(uint32_t magic, const void *mb_info) {
                 serial_write(" bytes\n");
             }
 
-            /* Load the model off the volume and check it against the copy
-             * compiled into this kernel. Both paths must produce identical
-             * bytes; if they do, the header can be deleted and the model can
-             * grow past the boot image. That comparison is the entire point of
-             * this rung, so it is verified rather than announced. */
-            static uint8_t blob[192 * 1024];
+            /* The model now lives ONLY here. There is no compiled-in copy to
+             * fall back on, which is the point: the kernel binary no longer
+             * grows with the model, and a bigger model is a new file on the
+             * volume rather than a rebuild.
+             *
+             * The blob is held in a static buffer for the life of the kernel
+             * because jl_lm points into it rather than copying 171 KiB to own
+             * a second time. */
+            static uint8_t blob[512 * 1024];
             uint32_t n = pewter_read("/models/core.nhit", blob, sizeof(blob));
-            if (n) {
+            if (n && jl_lm_load(blob, n)) {
+                uint32_t f = serial_lock();
                 serial_write("[nhit]  model loaded from /models/core.nhit (");
                 serial_dec(n);
                 serial_write(" bytes, checksum verified)\n");
-                if (jl_lm_verify_blob(blob, n))
-                    serial_stage("disk model byte-identical to compiled-in weights");
-                else
-                    serial_write("[nhit]  DISK MODEL DIFFERS from compiled-in weights\n");
+                serial_write("[nhit]  groups ");
+                serial_dec(jl_lm_groups());
+                serial_write(" heads ");
+                serial_dec(jl_lm_heads());
+                serial_write(" depth ");
+                serial_dec(jl_lm_depth());
+                serial_write(" vocab ");
+                serial_dec(jl_lm_vocab());
+                serial_write("\n[nhit]  ");
+                serial_dec(jl_lm_taps());
+                serial_write(" taps, ");
+                serial_dec(jl_lm_macs());
+                serial_write(" MACs per character\n");
+                serial_unlock(f);
+            } else if (n) {
+                serial_write("[nhit]  blob rejected -- shape does not match\n");
             }
             serial_stage("PEWTER-FS mounted");
         }
@@ -271,9 +287,8 @@ void kmain(uint32_t magic, const void *mb_info) {
      * on VGA, but that needs a keypress and cannot be captured headlessly --
      * this is the evidence a `make run-nographic` transcript can actually
      * contain, and it runs before any user input exists. */
-    if (!jl_lm_selftest()) {
-        serial_write("[lm]   SELFTEST FAILED -- weight tables disagree with "
-                     "nhit.h; predictions would be garbage\n");
+    if (!jl_lm_loaded()) {
+        serial_write("[lm]   no model on the volume -- inference unavailable\n");
     } else {
         serial_write("[lm]   taps ");
         serial_dec(jl_lm_taps());

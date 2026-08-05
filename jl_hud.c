@@ -306,7 +306,7 @@ void jl_hud_main(void) {
     uint32_t checksum = 0, decision = 0, lm_cycles = 0;
     char buf[32];
     static char completion[LM_OUT_CHARS + 1] = {0};
-    const int lm_ok = jl_lm_selftest();
+    const int lm_ok = jl_lm_loaded();
 
     for (uint32_t i = 0; i < 64u; i++) { probe_a[i] = (int8_t)(i + 1); probe_b[i] = (int32_t)(i * 3 + 1); }
     uint32_t p_reg = probe_reg();
@@ -401,13 +401,13 @@ void jl_hud_main(void) {
          * into a string, so this line cannot drift from what actually runs. */
         draw(2, 18, "JL_LM:", VGA_LIGHT_GREY, BG);
         if (!lm_ok) {
-            draw(9, 18, "SELFTEST FAILED - weight header disagrees with nhit.h",
+            draw(9, 18, "no model on the volume (/models/core.nhit)",
                  VGA_LIGHT_RED, BG);
         } else {
             size_t n = 0;
             n = utoa(jl_lm_taps(), buf);
             draw(9, 18, buf, VGA_YELLOW, BG);
-            draw(9 + n, 18, " taps, grouped NHIT, INT4, integer only",
+            draw(9 + n, 18, " taps from PEWTER-FS, grouped NHIT, INT4",
                  VGA_LIGHT_GREY, BG);
             draw(2, 19, "gen cycles", VGA_LIGHT_GREY, BG);
             utoa(lm_cycles, buf);

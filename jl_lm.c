@@ -2,30 +2,30 @@
  * JL OS :: JL_LM  --  language model inference (implementation)
  * ============================================================================
  * Integer only. Every value crossing this file is INT8, INT32 or a shift; there
- * is no float anywhere and no call outside nhit.c and this translation unit.
+ * is no float anywhere and no call outside nhit.c, the kernel heap, and this
+ * translation unit.
  * ============================================================================ */
 
 #include "jl_lm.h"
-#include "nhit_weights_mh.h"
+#include "kheap.h"
 
-/* Working buffers are static rather than automatic. At MH_GROUPS = 64 the
- * concatenated ring output alone is 4096 bytes, and the kernel stack is 16 KiB
- * shared with everything else -- putting these on the stack would make model
- * size silently couple to stack depth. */
-static int8_t  lm_bundle[NHIT_N];
-static int8_t  lm_rings[MH_GROUPS * NHIT_N];
-static int32_t lm_logits[MH_VOCAB];
-static NhitKernel lm_kernels[MH_GROUPS * MH_HEADS * MH_DEPTH];
-static int lm_ready = 0;
+/* Loaded model. All of it points into the blob the caller supplied, except the
+ * unpacked kernel array and the scratch buffers, which are heap-allocated.
+ * The blob itself is NOT copied -- it is already in memory and copying 171 KiB
+ * to own it would double the cost for no benefit. Callers must therefore keep
+ * the blob alive, which kmain does by holding it in a static buffer. */
+static uint32_t m_groups, m_heads, m_depth, m_vocab, m_read_dim, m_rings;
+static const uint8_t *m_chars;
+static const int8_t *m_embed;
+static const int8_t *m_read_w;
+static const int32_t *m_read_b;
 
-/* Map a character to its vocabulary index, or -1. MH_CHARS is sorted, but at 64
- * entries a linear scan is a handful of comparisons and needs no invariant
- * maintained at export time. */
-static int lm_index_of(char c) {
-    for (uint32_t i = 0; i < sizeof(MH_CHARS); i++)
-        if ((unsigned char)c == MH_CHARS[i]) return (int)i;
-    return -1;
-}
+static NhitKernel *m_kernels;
+static int8_t *m_bundle;
+static int8_t *m_ringbuf;
+static int32_t *m_logits;
+static uint32_t m_bytes;
+static int loaded = 0;
 
 static int8_t lm_sat8(int32_t v) {
     if (v > 127) return (int8_t)127;
@@ -33,61 +33,119 @@ static int8_t lm_sat8(int32_t v) {
     return (int8_t)v;
 }
 
-/* Unpack the generated tap/shift tables into the NhitKernel array once. The
- * tables are .rodata in the flat image; this just gives nhit_grouped the struct
- * layout it walks. */
-static void lm_init(void) {
-    const uint32_t rings = MH_GROUPS * MH_HEADS * MH_DEPTH;
-    for (uint32_t r = 0; r < rings; r++) {
-        lm_kernels[r].shift = (int8_t)MH_SHIFT[r];
-        for (uint32_t b = 0; b < NHIT_PACKED_BYTES; b++)
-            lm_kernels[r].taps[b] = MH_TAPS[r * NHIT_PACKED_BYTES + b];
+/* Map a character to its vocabulary index, or -1. Linear over 64 entries is a
+ * handful of comparisons and needs no invariant maintained at export time. */
+static int lm_index_of(char c) {
+    for (uint32_t i = 0; i < m_vocab; i++)
+        if ((unsigned char)c == m_chars[i]) return (int)i;
+    return -1;
+}
+
+int jl_lm_load(const uint8_t *blob, uint32_t len) {
+    loaded = 0;
+    if (!blob || len < 24) return 0;
+
+    const uint32_t *h = (const uint32_t *)blob;
+    if (h[0] != JL_LM_MAGIC) return 0;
+
+    uint32_t groups = h[1], heads = h[2], depth = h[3];
+    uint32_t vocab = h[4], read_dim = h[5];
+
+    /* Shape has to be self-consistent AND consistent with this kernel's ring
+     * size, which is a compile-time constant in nhit.h. A blob built for a
+     * different NHIT_N would index off the end of every buffer below. */
+    if (!groups || !heads || !depth || !vocab) return 0;
+    if (read_dim != groups * NHIT_N) return 0;
+
+    uint32_t rings = groups * heads * depth;
+
+    /* The declared shape must account for EXACTLY len bytes. A blob that is
+     * close but not exact still parses; it just reads the wrong weights and
+     * predicts confidently from them. */
+    uint32_t want = 24u
+                  + rings * NHIT_PACKED_BYTES     /* packed INT4 taps      */
+                  + rings                         /* per-ring shifts       */
+                  + vocab * NHIT_N                /* embedding             */
+                  + vocab * read_dim              /* readout matrix        */
+                  + vocab * 4u                    /* readout bias, INT32   */
+                  + vocab;                        /* character table       */
+    if (want != len) return 0;
+
+    const uint8_t *p = blob + 24;
+    const uint8_t *taps = p;                      p += rings * NHIT_PACKED_BYTES;
+    const int8_t  *shifts = (const int8_t *)p;    p += rings;
+    m_embed = (const int8_t *)p;                  p += vocab * NHIT_N;
+    m_read_w = (const int8_t *)p;                 p += vocab * read_dim;
+    m_read_b = (const int32_t *)p;                p += vocab * 4u;
+    m_chars = p;
+
+    /* Working state from the kernel heap. Before rung 9 these were static
+     * arrays sized by #define, which is exactly what tied model size to the
+     * kernel binary. */
+    NhitKernel *k = (NhitKernel *)kmalloc(rings * sizeof(NhitKernel));
+    int8_t *bundle = (int8_t *)kmalloc(NHIT_N);
+    int8_t *ringbuf = (int8_t *)kmalloc(read_dim);
+    int32_t *logits = (int32_t *)kmalloc(vocab * sizeof(int32_t));
+    if (!k || !bundle || !ringbuf || !logits) {
+        kfree(k); kfree(bundle); kfree(ringbuf); kfree(logits);
+        return 0;
     }
-    lm_ready = 1;
+
+    for (uint32_t r = 0; r < rings; r++) {
+        k[r].shift = shifts[r];
+        for (uint32_t b = 0; b < NHIT_PACKED_BYTES; b++)
+            k[r].taps[b] = taps[r * NHIT_PACKED_BYTES + b];
+    }
+
+    m_groups = groups; m_heads = heads; m_depth = depth;
+    m_vocab = vocab; m_read_dim = read_dim; m_rings = rings;
+    m_kernels = k; m_bundle = bundle; m_ringbuf = ringbuf; m_logits = logits;
+    m_bytes = len;
+    loaded = 1;
+    return 1;
 }
 
 /* Bundle the context into one ring: each character's INT8 embedding is rotated
- * by its position and the rotated vectors are summed. Accumulation is INT32 so
- * the sum cannot wrap before saturation is applied deliberately. */
+ * by its position and the rotated vectors summed. Accumulation is INT32 so the
+ * sum cannot wrap before saturation is applied deliberately. */
 static void lm_bundle_ctx(const char *ctx) {
     int32_t acc[NHIT_N];
     for (uint32_t i = 0; i < NHIT_N; i++) acc[i] = 0;
 
     for (uint32_t p = 0; p < JL_LM_CTX; p++) {
         int idx = lm_index_of(ctx[p]);
-        if (idx < 0) continue;              /* out-of-vocabulary: contributes nothing */
-        const signed char *e = &MH_EMBED[(uint32_t)idx * NHIT_N];
+        if (idx < 0) continue;          /* out of vocabulary: contributes nothing */
+        const int8_t *e = &m_embed[(uint32_t)idx * NHIT_N];
         for (uint32_t i = 0; i < NHIT_N; i++) {
-            /* Rotation by p on Z/N. This is what carries position -- rotating
-             * and summing is not commutative across different p, so the
-             * bundle distinguishes "ab" from "ba". */
+            /* Rotation by p on Z/N. This carries position -- rotating and
+             * summing does not commute across different p, so the bundle
+             * distinguishes "ab" from "ba". */
             acc[(i + p) & (NHIT_N - 1)] += (int32_t)e[i];
         }
     }
 
-    /* Scale the bundle back into INT8. Dividing by the context length keeps the
-     * range comparable to a single embedding, which is what the ring taps were
-     * trained against. */
+    /* Scale back into INT8. Dividing by the context length keeps the range
+     * comparable to a single embedding, which is what the taps trained against. */
     for (uint32_t i = 0; i < NHIT_N; i++)
-        lm_bundle[i] = lm_sat8(acc[i] / (int32_t)JL_LM_CTX);
+        m_bundle[i] = lm_sat8(acc[i] / (int32_t)JL_LM_CTX);
 }
 
 char jl_lm_predict(const char *ctx, int32_t *logit_out) {
-    if (!lm_ready) lm_init();
+    if (!loaded) return 0;
 
     lm_bundle_ctx(ctx);
-    nhit_grouped(lm_kernels, MH_GROUPS, MH_HEADS, MH_DEPTH,
-                 lm_bundle, lm_rings);
-    nhit_readout(MH_READ_W, MH_READ_B, MH_READ_DIM, MH_VOCAB,
-                 MH_READ_SHIFT, lm_rings, lm_logits);
+    nhit_grouped(m_kernels, m_groups, m_heads, m_depth, m_bundle, m_ringbuf);
+    nhit_readout(m_read_w, m_read_b, m_read_dim, m_vocab, 0,
+                 m_ringbuf, m_logits);
 
-    uint32_t best = nhit_argmax32(lm_logits, MH_VOCAB);
-    if (logit_out) *logit_out = lm_logits[best];
-    return (char)MH_CHARS[best];
+    uint32_t best = nhit_argmax32(m_logits, m_vocab);
+    if (logit_out) *logit_out = m_logits[best];
+    return (char)m_chars[best];
 }
 
 void jl_lm_generate(const char *seed, char *out, uint32_t n) {
     char ctx[JL_LM_CTX];
+    if (!loaded) { out[0] = 0; return; }
 
     /* Right-align the seed in the context window, padding with spaces. A seed
      * shorter than the window is the normal case, and left-aligning it would
@@ -102,70 +160,22 @@ void jl_lm_generate(const char *seed, char *out, uint32_t n) {
     for (uint32_t k = 0; k < n; k++) {
         char c = jl_lm_predict(ctx, 0);
         out[k] = c;
-        /* Slide the window: drop the oldest, append the prediction. */
         for (uint32_t i = 0; i + 1 < JL_LM_CTX; i++) ctx[i] = ctx[i + 1];
         ctx[JL_LM_CTX - 1] = c;
     }
     out[n] = 0;
 }
 
-int jl_lm_selftest(void) {
-    /* The weight header and nhit.h are generated and hand-written respectively,
-     * so nothing guarantees they agree. A mismatch here does not crash -- it
-     * produces confident nonsense -- which is exactly the failure worth
-     * catching at boot rather than discovering from output that looks plausible. */
-    if (sizeof(MH_CHARS) != MH_VOCAB) return 0;
-    if (MH_READ_DIM != MH_GROUPS * NHIT_N) return 0;
-    if (sizeof(MH_TAPS) !=
-        (uint32_t)MH_GROUPS * MH_HEADS * MH_DEPTH * NHIT_PACKED_BYTES) return 0;
-    if (sizeof(MH_SHIFT) != (uint32_t)MH_GROUPS * MH_HEADS * MH_DEPTH) return 0;
-    if (sizeof(MH_EMBED) != (uint32_t)MH_VOCAB * NHIT_N) return 0;
-    if (sizeof(MH_READ_W) != (uint32_t)MH_VOCAB * MH_READ_DIM) return 0;
-    return 1;
-}
-
-int jl_lm_verify_blob(const uint8_t *blob, uint32_t len) {
-    /* Layout must match export_multihead.py's blob writer exactly:
-     *   u32 magic 'NHIT', u32 groups, heads, depth, vocab, read_dim
-     *   packed taps, shifts, embed, readout weights, bias, chars
-     * Comparing against the compiled-in tables is what proves the on-disk
-     * form is trustworthy enough to replace them. */
-    const uint32_t hdr = 24;
-    if (len < hdr) return 0;
-    const uint32_t *h = (const uint32_t *)blob;
-    if (h[0] != 0x5449484Eu) return 0;                 /* "NHIT" */
-    if (h[1] != MH_GROUPS || h[2] != MH_HEADS || h[3] != MH_DEPTH) return 0;
-    if (h[4] != MH_VOCAB || h[5] != MH_READ_DIM) return 0;
-
-    const uint32_t rings = (uint32_t)MH_GROUPS * MH_HEADS * MH_DEPTH;
-    const uint8_t *p = blob + hdr;
-
-    for (uint32_t i = 0; i < rings * NHIT_PACKED_BYTES; i++)
-        if (*p++ != MH_TAPS[i]) return 0;
-    for (uint32_t i = 0; i < rings; i++)
-        if ((int8_t)*p++ != MH_SHIFT[i]) return 0;
-    for (uint32_t i = 0; i < (uint32_t)MH_VOCAB * NHIT_N; i++)
-        if ((int8_t)*p++ != MH_EMBED[i]) return 0;
-    for (uint32_t i = 0; i < (uint32_t)MH_VOCAB * MH_READ_DIM; i++)
-        if ((int8_t)*p++ != MH_READ_W[i]) return 0;
-
-    const int32_t *b = (const int32_t *)p;
-    for (uint32_t i = 0; i < MH_VOCAB; i++)
-        if (b[i] != MH_READ_B[i]) return 0;
-    p += 4u * MH_VOCAB;
-
-    for (uint32_t i = 0; i < MH_VOCAB; i++)
-        if (*p++ != MH_CHARS[i]) return 0;
-
-    return (uint32_t)(p - blob) == len;
-}
-
-uint32_t jl_lm_taps(void) {
-    return (uint32_t)MH_GROUPS * MH_HEADS * MH_DEPTH * NHIT_N;
-}
+int jl_lm_loaded(void) { return loaded; }
+uint32_t jl_lm_groups(void) { return m_groups; }
+uint32_t jl_lm_heads(void) { return m_heads; }
+uint32_t jl_lm_depth(void) { return m_depth; }
+uint32_t jl_lm_vocab(void) { return m_vocab; }
+uint32_t jl_lm_bytes(void) { return m_bytes; }
+uint32_t jl_lm_taps(void) { return loaded ? m_rings * NHIT_N : 0; }
 
 uint32_t jl_lm_macs(void) {
     /* Ring MACs plus the readout matrix. The readout is a real matrix and is
      * not free: at 64 groups it is 4096x64, comparable to the rings. */
-    return jl_lm_taps() * NHIT_N + (uint32_t)MH_READ_DIM * MH_VOCAB;
+    return loaded ? m_rings * NHIT_N * NHIT_N + m_read_dim * m_vocab : 0;
 }
