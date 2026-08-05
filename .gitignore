@@ -10,3 +10,11 @@ mh_model.pt
 mh_g16_snapshot.pt
 node_modules/
 dist/
+pewter.img
+core.nhit
+lm_valset.bin
+mh_model.pt
+mh_g16_snapshot.pt
+test_lm_host
+boot_serial.log
+corpus_frozen.txt

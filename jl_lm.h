@@ -49,6 +49,13 @@ void jl_lm_generate(const char *seed, char *out, uint32_t n);
  * confident garbage instead of a visible failure. */
 int jl_lm_selftest(void);
 
+/* Compare a model blob read from PEWTER-FS against the weights compiled into
+ * this kernel. Non-zero if every byte matches. This is the check that licenses
+ * deleting the compiled-in copy: until the on-disk form is proven identical,
+ * moving the model to disk is a change of storage AND a change of weights, and
+ * a failure could not be attributed to either. */
+int jl_lm_verify_blob(const uint8_t *blob, uint32_t len);
+
 /* Model shape, for the HUD to report what is actually running. */
 uint32_t jl_lm_taps(void);
 uint32_t jl_lm_macs(void);

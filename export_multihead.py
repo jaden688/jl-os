@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import pathlib
+import struct
 
 import torch
 
@@ -218,6 +219,23 @@ def main() -> int:
             ck["val_text"].encode("latin-1", errors="replace"))
         print(f"  wrote lm_valset.bin ({len(ck['val_text']):,} chars), "
               f"torch reported acc {ck.get('val_acc', float('nan')):.4f}")
+
+    # --- loadable blob for PEWTER-FS ----------------------------------------
+    # The same weights as the C header, as a flat binary the kernel reads off
+    # disk at boot. This is what decouples model size from kernel image size:
+    # the header form must fit inside the 576 KB boot image, the blob form is
+    # bounded only by the volume.
+    blob = bytearray()
+    blob += struct.pack("<6I", 0x5449484E,      # "NHIT"
+                        G, H, D, vocab, G * N)
+    blob += bytes(packed)
+    blob += bytes((s & 0xFF) for s in shifts)
+    blob += emb.flatten().to(torch.int8).numpy().tobytes()
+    blob += rw.flatten().to(torch.int8).numpy().tobytes()
+    blob += bias.numpy().astype("<i4").tobytes()
+    blob += bytes(ord(c) for c in ck["chars"])
+    (HERE / "core.nhit").write_bytes(blob)
+    print(f"  wrote core.nhit ({len(blob):,} bytes) for the PEWTER volume")
 
     tot = len(packed) + emb.numel() + rw.numel() + 4 * len(bias) + len(shifts)
     print(f"groups={G} heads={H} depth={D} vocab={vocab}")

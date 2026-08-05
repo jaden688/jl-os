@@ -124,6 +124,42 @@ int jl_lm_selftest(void) {
     return 1;
 }
 
+int jl_lm_verify_blob(const uint8_t *blob, uint32_t len) {
+    /* Layout must match export_multihead.py's blob writer exactly:
+     *   u32 magic 'NHIT', u32 groups, heads, depth, vocab, read_dim
+     *   packed taps, shifts, embed, readout weights, bias, chars
+     * Comparing against the compiled-in tables is what proves the on-disk
+     * form is trustworthy enough to replace them. */
+    const uint32_t hdr = 24;
+    if (len < hdr) return 0;
+    const uint32_t *h = (const uint32_t *)blob;
+    if (h[0] != 0x5449484Eu) return 0;                 /* "NHIT" */
+    if (h[1] != MH_GROUPS || h[2] != MH_HEADS || h[3] != MH_DEPTH) return 0;
+    if (h[4] != MH_VOCAB || h[5] != MH_READ_DIM) return 0;
+
+    const uint32_t rings = (uint32_t)MH_GROUPS * MH_HEADS * MH_DEPTH;
+    const uint8_t *p = blob + hdr;
+
+    for (uint32_t i = 0; i < rings * NHIT_PACKED_BYTES; i++)
+        if (*p++ != MH_TAPS[i]) return 0;
+    for (uint32_t i = 0; i < rings; i++)
+        if ((int8_t)*p++ != MH_SHIFT[i]) return 0;
+    for (uint32_t i = 0; i < (uint32_t)MH_VOCAB * NHIT_N; i++)
+        if ((int8_t)*p++ != MH_EMBED[i]) return 0;
+    for (uint32_t i = 0; i < (uint32_t)MH_VOCAB * MH_READ_DIM; i++)
+        if ((int8_t)*p++ != MH_READ_W[i]) return 0;
+
+    const int32_t *b = (const int32_t *)p;
+    for (uint32_t i = 0; i < MH_VOCAB; i++)
+        if (b[i] != MH_READ_B[i]) return 0;
+    p += 4u * MH_VOCAB;
+
+    for (uint32_t i = 0; i < MH_VOCAB; i++)
+        if (*p++ != MH_CHARS[i]) return 0;
+
+    return (uint32_t)(p - blob) == len;
+}
+
 uint32_t jl_lm_taps(void) {
     return (uint32_t)MH_GROUPS * MH_HEADS * MH_DEPTH * NHIT_N;
 }

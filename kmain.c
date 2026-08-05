@@ -19,6 +19,8 @@
 #include "vmm.h"
 #include "kheap.h"
 #include "task.h"
+#include "ata.h"
+#include "pewter.h"
 
 /* Two workers, so preemption is demonstrated rather than asserted. Neither
  * calls sched_yield: if these interleave in the log, the PIT took the CPU away
@@ -218,6 +220,50 @@ void kmain(uint32_t magic, const void *mb_info) {
     sched_init();
     task_spawn("worker-a", worker_a);
     task_spawn("worker-b", worker_b);
+    /* Preemption is armed AFTER storage is up, not here. Bringing it up first
+     * let the workers preempt kmain mid-line, and PEWTER's free-space scan
+     * walks the whole bitmap off disk -- long enough that "[pewter] 31 MiB
+     * free" came out split around a worker's output. Serial writes are not
+     * atomic and a preemptive kernel will interleave them; the fix is to
+     * finish booting before anything else is allowed to run. */
+
+    /* Rung 13. INT 13h died at CR0.PE; this is the kernel talking to the IDE
+     * controller itself, and it is what unbinds storage from the boot image. */
+    if (ata_init()) {
+        serial_stage("ATA PIO driver online");
+
+        /* Rung 14. PEWTER-FS: Persistent Extent Write, Table, Entry, Retrieval. */
+        if (pewter_mount()) {
+            for (uint32_t i = 0; i < pewter_file_count(); i++) {
+                const PewterEntry *e = pewter_entry_at(i);
+                if (!e) continue;
+                serial_write("[pewter]   ");
+                serial_write(e->name);
+                serial_write("  ");
+                serial_dec(e->size);
+                serial_write(" bytes\n");
+            }
+
+            /* Load the model off the volume and check it against the copy
+             * compiled into this kernel. Both paths must produce identical
+             * bytes; if they do, the header can be deleted and the model can
+             * grow past the boot image. That comparison is the entire point of
+             * this rung, so it is verified rather than announced. */
+            static uint8_t blob[192 * 1024];
+            uint32_t n = pewter_read("/models/core.nhit", blob, sizeof(blob));
+            if (n) {
+                serial_write("[nhit]  model loaded from /models/core.nhit (");
+                serial_dec(n);
+                serial_write(" bytes, checksum verified)\n");
+                if (jl_lm_verify_blob(blob, n))
+                    serial_stage("disk model byte-identical to compiled-in weights");
+                else
+                    serial_write("[nhit]  DISK MODEL DIFFERS from compiled-in weights\n");
+            }
+            serial_stage("PEWTER-FS mounted");
+        }
+    }
+
     sched_enable_preemption();
     serial_stage("preemptive scheduler online (MK-2 is no longer simulated)");
 

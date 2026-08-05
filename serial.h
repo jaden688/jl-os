@@ -34,6 +34,22 @@ void serial_hex32(uint32_t v);
  * can be localised to the gap between two known-good points. */
 void serial_stage(const char *stage);
 
+/* A log LINE is usually several serial_write/serial_dec calls, and the timer
+ * IRQ writes to the same port. Without a lock, "[pewter] 31 MiB free" comes out
+ * with "[timer] tick 100" spliced into the middle of it -- which looks like a
+ * cosmetic annoyance and is actually two writers sharing a device with no
+ * mutual exclusion. Wrap a whole line:
+ *
+ *     uint32_t f = serial_lock();
+ *     serial_write("[pewter] "); serial_dec(n); serial_write(" MiB free\n");
+ *     serial_unlock(f);
+ *
+ * Saves and RESTORES the interrupt flag rather than unconditionally re-enabling,
+ * so calling this from inside an IRQ handler does not silently turn interrupts
+ * back on partway through one. */
+uint32_t serial_lock(void);
+void serial_unlock(uint32_t flags);
+
 /* Disable interrupts, report the reason on serial and VGA, halt forever.
  * Never returns. */
 void panic(const char *reason) __attribute__((noreturn));

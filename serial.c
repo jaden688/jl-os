@@ -120,3 +120,15 @@ void panic(const char *reason) {
     panic_vga(reason);
     for (;;) __asm__ __volatile__("hlt");
 }
+
+uint32_t serial_lock(void) {
+    uint32_t flags;
+    /* pushfl/cli captures the CURRENT interrupt state before masking, so
+     * serial_unlock can put it back exactly as it was. */
+    __asm__ __volatile__("pushfl; popl %0; cli" : "=r"(flags) :: "memory");
+    return flags;
+}
+
+void serial_unlock(uint32_t flags) {
+    __asm__ __volatile__("pushl %0; popfl" :: "r"(flags) : "memory", "cc");
+}

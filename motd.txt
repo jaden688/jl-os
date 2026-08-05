@@ -1,0 +1,2 @@
+JL/OS -- bare metal, no runtime beneath.
+NHIT inference core, MK preemptive scheduler, PEWTER-FS.
