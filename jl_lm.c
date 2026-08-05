@@ -15,6 +15,7 @@
  * to own it would double the cost for no benefit. Callers must therefore keep
  * the blob alive, which kmain does by holding it in a static buffer. */
 static uint32_t m_groups, m_heads, m_depth, m_vocab, m_read_dim, m_rings;
+static uint32_t m_ctx;
 static const uint8_t *m_chars;
 static const int8_t *m_embed;
 static const int8_t *m_read_w;
@@ -43,26 +44,27 @@ static int lm_index_of(char c) {
 
 int jl_lm_load(const uint8_t *blob, uint32_t len) {
     loaded = 0;
-    if (!blob || len < 24) return 0;
+    if (!blob || len < 28) return 0;
 
     const uint32_t *h = (const uint32_t *)blob;
     if (h[0] != JL_LM_MAGIC) return 0;
 
     uint32_t groups = h[1], heads = h[2], depth = h[3];
-    uint32_t vocab = h[4], read_dim = h[5];
+    uint32_t vocab = h[4], read_dim = h[5], ctx = h[6];
 
     /* Shape has to be self-consistent AND consistent with this kernel's ring
      * size, which is a compile-time constant in nhit.h. A blob built for a
      * different NHIT_N would index off the end of every buffer below. */
     if (!groups || !heads || !depth || !vocab) return 0;
     if (read_dim != groups * NHIT_N) return 0;
+    if (!ctx || ctx > JL_LM_CTX_MAX) return 0;
 
     uint32_t rings = groups * heads * depth;
 
     /* The declared shape must account for EXACTLY len bytes. A blob that is
      * close but not exact still parses; it just reads the wrong weights and
      * predicts confidently from them. */
-    uint32_t want = 24u
+    uint32_t want = 28u
                   + rings * NHIT_PACKED_BYTES     /* packed INT4 taps      */
                   + rings                         /* per-ring shifts       */
                   + vocab * NHIT_N                /* embedding             */
@@ -71,7 +73,7 @@ int jl_lm_load(const uint8_t *blob, uint32_t len) {
                   + vocab;                        /* character table       */
     if (want != len) return 0;
 
-    const uint8_t *p = blob + 24;
+    const uint8_t *p = blob + 28;
     const uint8_t *taps = p;                      p += rings * NHIT_PACKED_BYTES;
     const int8_t  *shifts = (const int8_t *)p;    p += rings;
     m_embed = (const int8_t *)p;                  p += vocab * NHIT_N;
@@ -98,7 +100,7 @@ int jl_lm_load(const uint8_t *blob, uint32_t len) {
     }
 
     m_groups = groups; m_heads = heads; m_depth = depth;
-    m_vocab = vocab; m_read_dim = read_dim; m_rings = rings;
+    m_vocab = vocab; m_read_dim = read_dim; m_rings = rings; m_ctx = ctx;
     m_kernels = k; m_bundle = bundle; m_ringbuf = ringbuf; m_logits = logits;
     m_bytes = len;
     loaded = 1;
@@ -112,7 +114,7 @@ static void lm_bundle_ctx(const char *ctx) {
     int32_t acc[NHIT_N];
     for (uint32_t i = 0; i < NHIT_N; i++) acc[i] = 0;
 
-    for (uint32_t p = 0; p < JL_LM_CTX; p++) {
+    for (uint32_t p = 0; p < m_ctx; p++) {
         int idx = lm_index_of(ctx[p]);
         if (idx < 0) continue;          /* out of vocabulary: contributes nothing */
         const int8_t *e = &m_embed[(uint32_t)idx * NHIT_N];
@@ -127,7 +129,7 @@ static void lm_bundle_ctx(const char *ctx) {
     /* Scale back into INT8. Dividing by the context length keeps the range
      * comparable to a single embedding, which is what the taps trained against. */
     for (uint32_t i = 0; i < NHIT_N; i++)
-        m_bundle[i] = lm_sat8(acc[i] / (int32_t)JL_LM_CTX);
+        m_bundle[i] = lm_sat8(acc[i] / (int32_t)m_ctx);
 }
 
 char jl_lm_predict(const char *ctx, int32_t *logit_out) {
@@ -144,7 +146,7 @@ char jl_lm_predict(const char *ctx, int32_t *logit_out) {
 }
 
 void jl_lm_generate(const char *seed, char *out, uint32_t n) {
-    char ctx[JL_LM_CTX];
+    char ctx[JL_LM_CTX_MAX];
     if (!loaded) { out[0] = 0; return; }
 
     /* Right-align the seed in the context window, padding with spaces. A seed
@@ -152,16 +154,16 @@ void jl_lm_generate(const char *seed, char *out, uint32_t n) {
      * put the useful characters at the wrong rotations entirely. */
     uint32_t len = 0;
     while (seed[len]) len++;
-    for (uint32_t i = 0; i < JL_LM_CTX; i++) {
-        uint32_t back = JL_LM_CTX - i;
+    for (uint32_t i = 0; i < m_ctx; i++) {
+        uint32_t back = m_ctx - i;
         ctx[i] = (len >= back) ? seed[len - back] : ' ';
     }
 
     for (uint32_t k = 0; k < n; k++) {
         char c = jl_lm_predict(ctx, 0);
         out[k] = c;
-        for (uint32_t i = 0; i + 1 < JL_LM_CTX; i++) ctx[i] = ctx[i + 1];
-        ctx[JL_LM_CTX - 1] = c;
+        for (uint32_t i = 0; i + 1 < m_ctx; i++) ctx[i] = ctx[i + 1];
+        ctx[m_ctx - 1] = c;
     }
     out[n] = 0;
 }
@@ -172,6 +174,7 @@ uint32_t jl_lm_heads(void) { return m_heads; }
 uint32_t jl_lm_depth(void) { return m_depth; }
 uint32_t jl_lm_vocab(void) { return m_vocab; }
 uint32_t jl_lm_bytes(void) { return m_bytes; }
+uint32_t jl_lm_ctx(void) { return m_ctx; }
 uint32_t jl_lm_taps(void) { return loaded ? m_rings * NHIT_N : 0; }
 
 uint32_t jl_lm_macs(void) {

@@ -35,7 +35,18 @@
 #include "jl_core.h"
 #include "nhit.h"
 
-#define JL_LM_CTX 16          /* characters of context; must match training */
+/* Upper bound on context, used only to size a stack buffer. The ACTUAL context
+ * length is read from the blob header -- it is a property of the trained model,
+ * and a kernel that assumed its own value would parse a mismatched blob happily
+ * and predict from the wrong number of characters with nothing to show for it.
+ *
+ * Measured, and the reason this matters: the bundle superposes CTX characters
+ * into N INT8 values by rotation, and HRR capacity is about N/(4 ln N) -- ~4
+ * items at N=64. Accuracy peaks at CTX=4 (+0.2599 over baseline) and collapses
+ * to +0.0009 at CTX=32, where the model learns nothing at all. A
+ * parameter-matched LSTM is flat across the same range, so this is the
+ * encoding's bound, not the task's. */
+#define JL_LM_CTX_MAX 64
 #define JL_LM_MAGIC 0x5449484Eu   /* "NHIT" */
 
 /* Parse a model blob and allocate its working state from the kernel heap.
@@ -66,5 +77,6 @@ uint32_t jl_lm_heads(void);
 uint32_t jl_lm_depth(void);
 uint32_t jl_lm_vocab(void);
 uint32_t jl_lm_bytes(void);
+uint32_t jl_lm_ctx(void);
 
 #endif

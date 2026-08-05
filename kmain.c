@@ -186,8 +186,9 @@ void kmain(uint32_t magic, const void *mb_info) {
     boot_line("[hw]   COM1 at 0x3F8, 115200 8N1\n", green_col);
     boot_line("[kern] no Linux, no libc, no POSIX, no host runtime\n", yellow_col);
 
-    /* JlOsState holds the MK-1/2/3 descriptors. Scheduling and token selection
-     * inside it are SIMULATED -- see ARCHITECTURE.md. NHIT arithmetic is real. */
+    /* JlOsState holds the MK-1/2/3 descriptors. MK-2's scheduling is no longer
+     * simulated -- task.c runs real preemptive kernel threads. MK-3 IPC is
+     * still a stub and is labelled as such below. */
     static JlOsState state;
     jl_os_init(&state);
     serial_stage("JL runtime initialized (JlOsState)");
@@ -267,6 +268,8 @@ void kmain(uint32_t magic, const void *mb_info) {
                 serial_dec(jl_lm_depth());
                 serial_write(" vocab ");
                 serial_dec(jl_lm_vocab());
+                serial_write(" ctx ");
+                serial_dec(jl_lm_ctx());
                 serial_write("\n[nhit]  ");
                 serial_dec(jl_lm_taps());
                 serial_write(" taps, ");

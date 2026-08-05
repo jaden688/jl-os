@@ -35,6 +35,13 @@ import torch.nn.functional as F
 HERE = pathlib.Path(__file__).resolve().parent
 CORPUS = HERE / "corpus_frozen.txt"
 N = 64          # ring size; must match NHIT_N and stay a power of two
+
+# Context length is a VARIABLE, not a constant, because it is the thing under
+# test. The bundle superposes CTX characters into N INT8 values by rotation;
+# HRR capacity goes roughly as N/(4 ln N), which at N=64 is about 4 items. If
+# that bound is what limits the model, then SHORTENING the context should
+# IMPROVE accuracy -- a backwards prediction, and the reason this is a real
+# test rather than a confirmation.
 CTX = 16
 
 
@@ -117,12 +124,16 @@ def main() -> int:
     ap.add_argument("--heads", type=int, default=64, help="heads per group")
     ap.add_argument("--groups", type=int, default=16)
     ap.add_argument("--depth", type=int, default=3)
+    ap.add_argument("--ctx", type=int, default=16)
     ap.add_argument("--steps", type=int, default=3000)
     ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--chars", type=int, default=4_000_000,
                     help="corpus slice; the full 17.9M is slow to window")
     ap.add_argument("--out", default="nhit_weights_mh.h")
     args = ap.parse_args()
+
+    global CTX
+    CTX = args.ctx
 
     if not CORPUS.exists():
         print("corpus_frozen.txt missing -- run freeze_corpus.py first")
@@ -175,7 +186,7 @@ def main() -> int:
     print(f"corpus     frozen, sha256 {digest[:16]}...")
     print(f"           using {len(text):,} of 17,859,972 chars, vocab {vocab}")
     print(f"model      groups={args.groups} heads={args.heads} "
-          f"depth={args.depth} N={N}")
+          f"depth={args.depth} N={N} CTX={CTX}")
     print(f"           {taps_total:,} taps, readout {args.groups*N}->{vocab}")
     print(f"bytes      taps {b_taps/1024:>7.0f} KB   INT4")
     print(f"           read {b_read/1024:>7.0f} KB   INT8  (scales with groups)")
@@ -231,7 +242,7 @@ def main() -> int:
                 "head_w": model.head.weight.detach().cpu(),
                 "head_b": model.head.bias.detach().cpu(),
                 "chars": "".join(chars), "heads": args.heads,
-                "groups": args.groups, "depth": args.depth,
+                "groups": args.groups, "depth": args.depth, "ctx": CTX,
                 # The exact validation slice, so the C integer path can be
                 # scored on the SAME windows rather than on a re-derived split.
                 # Reproducing the split in C would be duplicated logic, and any

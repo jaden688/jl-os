@@ -78,8 +78,8 @@ int main(int argc, char **argv) {
     for (int i = 1; i < 256; i++) if (freq[i] > freq[major]) major = i;
 
     long correct = 0, major_correct = 0, total = 0;
-    for (long i = 0; i + JL_LM_CTX + 1 <= n; i++) {
-        char target = text[i + JL_LM_CTX];
+    for (long i = 0; i + (long)jl_lm_ctx() + 1 <= n; i++) {
+        char target = text[i + jl_lm_ctx()];
         char pred = jl_lm_predict(&text[i], 0);
         if (pred == target) correct++;
         if ((unsigned char)target == (unsigned char)major) major_correct++;
@@ -103,7 +103,7 @@ int main(int argc, char **argv) {
      * looking like it works. Count distinct predictions so that failure is
      * visible rather than inferred. */
     int seen[256] = {0}, distinct = 0;
-    for (long i = 0; i + JL_LM_CTX + 1 <= n && i < 4096; i++) {
+    for (long i = 0; i + (long)jl_lm_ctx() + 1 <= n && i < 4096; i++) {
         unsigned char p = (unsigned char)jl_lm_predict(&text[i], 0);
         if (!seen[p]) { seen[p] = 1; distinct++; }
     }
