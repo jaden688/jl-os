@@ -52,13 +52,51 @@ _boot_start:
 
     /* ---- read the kernel image from the disc -------------------------- */
     /* INT 13h AH=42h takes a Disk Address Packet rather than CHS, which is
-     * the only sane option for a CD: 2048-byte sectors and LBA addressing. */
+     * the only sane option for a CD: 2048-byte sectors and LBA addressing.
+     *
+     * The read is CHUNKED, and it must be. The DAP's buffer is a real-mode
+     * segment:offset pair, so a single transfer cannot cross a 64 KiB segment
+     * boundary -- BIOSes fail the call outright rather than wrapping. A 20 KiB
+     * kernel loaded in one call and hid this; a 196 KiB kernel does not.
+     *
+     * 16 sectors x 2048 = 32 KiB per read, comfortably inside one segment, and
+     * the buffer segment advances by 0x800 paragraphs (32 KiB) each pass. */
+    /* mkiso.py patches the TOTAL sector count into the DAP's count field. Read
+     * it out before the loop, which then reuses that field as the per-chunk
+     * count. Keeping the DAP layout byte-identical matters: mkiso.py locates it
+     * by signature and patches at fixed sub-offsets, so adding a field here
+     * would silently shift kernel_dwords and load the wrong size. */
+    movw    dap_count, %cx          /* total 2048-byte sectors remaining */
+read_loop:
+    testw   %cx, %cx
+    jz      read_done
+
+    movw    $16, %ax                /* sectors this pass */
+    cmpw    %ax, %cx
+    jae     1f
+    movw    %cx, %ax                /* final partial chunk */
+1:  movw    %ax, dap_count
+
+    pushw   %cx
     movw    $dap, %si
     movb    $0x42, %ah
     movb    boot_drive, %dl
     int     $0x13
+    popw    %cx
     jc      disk_error
 
+    /* Advance LBA by the sectors just read, and the destination segment by the
+     * same number of 32-byte paragraphs (2048 bytes = 0x80 paragraphs). */
+    movw    dap_count, %ax
+    addw    %ax, kernel_lba
+    adcw    $0, kernel_lba+2
+    movw    %ax, %bx
+    shlw    $7, %bx                 /* sectors * 0x80 paragraphs */
+    addw    %bx, dap_segment
+    subw    %ax, %cx
+    jmp     read_loop
+
+read_done:
     movw    $msg_loaded, %si
     call    print_string
 
@@ -143,10 +181,11 @@ protected_mode:
 dap:
     .byte   0x10                /* packet size */
     .byte   0                   /* reserved */
-kernel_sectors:
-    .word   0x0001              /* PATCHED: 2048-byte sectors to read */
+dap_count:
+    .word   0x0001              /* sectors for THIS transfer; set per chunk */
     .word   0x0000              /* buffer offset  (0x10000 = 0x1000:0x0000) */
-    .word   0x1000              /* buffer segment */
+dap_segment:
+    .word   0x1000              /* buffer segment; advances each chunk */
 kernel_lba:
     .quad   0x0000000000000000  /* PATCHED: LBA of the kernel inside the ISO */
 

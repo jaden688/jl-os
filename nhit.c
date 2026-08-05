@@ -40,6 +40,11 @@ static int8_t sat8(int32_t v) {
 uint32_t nhit_unpack_cycles = 0;
 uint32_t nhit_mac_cycles = 0;
 
+void nhit_prof_reset(void) {
+    nhit_unpack_cycles = 0;
+    nhit_mac_cycles = 0;
+}
+
 static inline uint64_t nhit_rdtsc(void) {
     uint32_t lo, hi;
     __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
@@ -74,8 +79,10 @@ void nhit_relu(int8_t *v, uint32_t n) {
 void nhit_stack(const NhitKernel *kernels, uint32_t depth,
                 const int8_t *in, int8_t *out) {
     int8_t a[NHIT_N], b[NHIT_N];
-    nhit_unpack_cycles = 0;
-    nhit_mac_cycles = 0;
+    /* Counters are NOT reset here. nhit_multihead calls this once per head, so
+     * resetting on entry would leave the HUD reporting only the final head --
+     * under-reporting real work by a factor of `heads`. Callers reset once, up
+     * front, via nhit_prof_reset(). */
     for (uint32_t i = 0; i < NHIT_N; i++) a[i] = in[i];
 
     for (uint32_t d = 0; d < depth; d++) {
@@ -87,6 +94,65 @@ void nhit_stack(const NhitKernel *kernels, uint32_t depth,
         for (uint32_t i = 0; i < NHIT_N; i++) a[i] = b[i];
     }
     for (uint32_t i = 0; i < NHIT_N; i++) out[i] = a[i];
+}
+
+void nhit_multihead(const NhitKernel *kernels, uint32_t heads, uint32_t depth,
+                    const int8_t *in, int8_t *out) {
+    int32_t acc[NHIT_N];
+    int8_t head_out[NHIT_N];
+
+    for (uint32_t i = 0; i < NHIT_N; i++) acc[i] = 0;
+
+    for (uint32_t h = 0; h < heads; h++) {
+        /* Each head sees the unmodified input; heads never interact. That
+         * independence is what makes this parallelisable and what keeps the
+         * working set to one ring regardless of head count. */
+        nhit_stack(&kernels[h * depth], depth, in, head_out);
+        for (uint32_t i = 0; i < NHIT_N; i++) acc[i] += (int32_t)head_out[i];
+    }
+
+    /* Mean over heads, so the output range matches a single head and the
+     * downstream INT8 assumption still holds. */
+    for (uint32_t i = 0; i < NHIT_N; i++) {
+        int32_t v = heads ? acc[i] / (int32_t)heads : 0;
+        out[i] = sat8(v);
+    }
+}
+
+void nhit_grouped(const NhitKernel *kernels, uint32_t groups, uint32_t heads,
+                  uint32_t depth, const int8_t *in, int8_t *out) {
+    const uint32_t per_group = heads * depth;
+    for (uint32_t g = 0; g < groups; g++) {
+        /* Each group sees the same input and writes its own NHIT_N slot. The
+         * concatenation is the point: it is what keeps the representation
+         * reaching the readout at groups*N rather than collapsing to N. */
+        nhit_multihead(&kernels[g * per_group], heads, depth,
+                       in, &out[g * NHIT_N]);
+    }
+}
+
+void nhit_readout(const int8_t *w, const int32_t *bias, uint32_t in_dim,
+                  uint32_t out_dim, int32_t shift,
+                  const int8_t *in, int32_t *out) {
+    for (uint32_t r = 0; r < out_dim; r++) {
+        const int8_t *row = &w[r * in_dim];
+        int32_t acc = 0;
+        for (uint32_t c = 0; c < in_dim; c++) acc += (int32_t)in[c] * row[c];
+        /* Logits stay INT32. Saturating them to INT8 here would discard the
+         * separation argmax depends on -- the ranking is the output, not the
+         * magnitude, so there is nothing to gain by narrowing it. */
+        out[r] = (shift >= 0 ? (acc >> shift) : (acc << (-shift)))
+                 + (bias ? bias[r] : 0);
+    }
+}
+
+uint32_t nhit_argmax32(const int32_t *v, uint32_t n) {
+    uint32_t best = 0;
+    int32_t bestv = (int32_t)0x80000000;
+    for (uint32_t i = 0; i < n; i++) {
+        if (v[i] > bestv) { bestv = v[i]; best = i; }
+    }
+    return best;
 }
 
 uint32_t nhit_argmax(const int8_t *v, uint32_t n) {

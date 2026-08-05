@@ -14,6 +14,15 @@
 #include "serial.h"
 #include "idt.h"
 #include "pic_pit.h"
+#include "jl_lm.h"
+
+/* Local to this file: jl_hud.c has its own, and a shared one would mean an
+ * extra translation unit for two instructions. */
+static inline uint64_t rdtsc_kmain(void) {
+    uint32_t lo, hi;
+    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
 
 /* Passed in EAX by any Multiboot 1 compliant loader. Distinct from the header
  * magic 0x1BADB002 that GRUB searched for in our image. */
@@ -152,6 +161,40 @@ void kmain(uint32_t magic, const void *mb_info) {
     boot_line("[jl]   MK-1 tensor/NHIT ring engine    : online\n", green_col);
     boot_line("[jl]   MK-2 scheduler descriptors      : online (simulated)\n", green_col);
     boot_line("[jl]   MK-3 IPC ring bus               : online\n", green_col);
+
+    /* Run the model once at boot and report over COM1. The HUD shows inference
+     * on VGA, but that needs a keypress and cannot be captured headlessly --
+     * this is the evidence a `make run-nographic` transcript can actually
+     * contain, and it runs before any user input exists. */
+    if (!jl_lm_selftest()) {
+        serial_write("[lm]   SELFTEST FAILED -- weight tables disagree with "
+                     "nhit.h; predictions would be garbage\n");
+    } else {
+        serial_write("[lm]   taps ");
+        serial_dec(jl_lm_taps());
+        serial_write("  MACs/char ");
+        serial_dec(jl_lm_macs());
+        serial_write("\n");
+
+        char out[33];
+        uint64_t t0 = rdtsc_kmain();
+        jl_lm_generate("the ", out, 32);
+        uint32_t cyc = (uint32_t)(rdtsc_kmain() - t0);
+
+        serial_write("[lm]   greedy continuation of \"the \" -> \"");
+        for (uint32_t i = 0; out[i]; i++) {
+            /* Escaped: a run of newlines would otherwise print as blank output
+             * that reads as a failure to run at all. */
+            if (out[i] == '\n') serial_write("\\n");
+            else if (out[i] == '\t') serial_write("\\t");
+            else { char s[2]; s[0] = out[i]; s[1] = 0; serial_write(s); }
+        }
+        serial_write("\"\n");
+        serial_write("[lm]   32 chars in ");
+        serial_dec(cyc);
+        serial_write(" cycles\n");
+        serial_stage("JL_LM inference executed in ring 0, no runtime beneath");
+    }
 
     serial_stage("entering HUD (owns display and PS/2 from here)");
     boot_line("[hud]  handing display to native HUD\n", yellow_col);

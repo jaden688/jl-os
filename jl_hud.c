@@ -18,6 +18,7 @@
 #include "jl_core.h"
 #include "nhit.h"
 #include "nhit_weights.h"
+#include "jl_lm.h"
 #include "pic_pit.h"
 
 /* ------------------------------------------------------------------ ports -- */
@@ -190,6 +191,9 @@ static uint64_t run_nhit(const char *prompt, uint32_t len,
             kernels[d].taps[t] = NHIT_TRAINED_TAPS[d][t];
     }
 
+    /* nhit_stack no longer self-resets, so multi-head callers can accumulate
+     * across heads. Single-stack callers reset here instead. */
+    nhit_prof_reset();
     uint64_t t0 = rdtsc();
     nhit_stack(kernels, NHIT_DEPTH, in, out);
     uint64_t t1 = rdtsc();
@@ -288,6 +292,8 @@ static uint32_t probe_rdtsc_cost(void) {
 /* -------------------------------------------------------------------- hud -- */
 
 #define PROMPT_MAX 56
+/* Fits the 80-column line after the "MODEL:" label at column 10. */
+#define LM_OUT_CHARS 64
 
 void jl_hud_main(void) {
     const uint8_t BG = VGA_BLUE;
@@ -296,8 +302,10 @@ void jl_hud_main(void) {
     prompt[0] = '\0';
 
     uint64_t frames = 0, total_cycles = 0, runs = 0, last_cycles = 0;
-    uint32_t checksum = 0, decision = 0;
+    uint32_t checksum = 0, decision = 0, lm_cycles = 0;
     char buf[32];
+    static char completion[LM_OUT_CHARS + 1] = {0};
+    const int lm_ok = jl_lm_selftest();
 
     for (uint32_t i = 0; i < 64u; i++) { probe_a[i] = (int8_t)(i + 1); probe_b[i] = (int32_t)(i * 3 + 1); }
     uint32_t p_reg = probe_reg();
@@ -313,6 +321,14 @@ void jl_hud_main(void) {
                 last_cycles = run_nhit(prompt, plen, &checksum, &decision);
                 total_cycles += last_cycles;
                 runs++;
+
+                /* The actual model: 196,608 trained INT4 taps, run in ring 0
+                 * with no runtime underneath. Greedy argmax -- there is no
+                 * entropy source in the kernel, and inventing one would make
+                 * the output irreproducible. */
+                uint64_t g0 = rdtsc();
+                jl_lm_generate(prompt, completion, LM_OUT_CHARS);
+                lm_cycles = (uint32_t)(rdtsc() - g0);
             }
         } else if (c == '\b') {
             if (plen) prompt[--plen] = '\0';
@@ -368,14 +384,29 @@ void jl_hud_main(void) {
         draw(3, 13, "> ", VGA_LIGHT_GREEN, BG);
         draw(5, 13, prompt, VGA_WHITE, BG);
         put_at(5 + plen, 13, (frames & 0x20) ? '_' : ' ', VGA_WHITE, BG);
-        draw(3, 15, runs ? "ENTER ran NHIT ring convolution over your bytes."
-                         : "Type a prompt and press ENTER.",
+        draw(3, 15, runs ? "MODEL:" : "Type a prompt and press ENTER.",
              VGA_LIGHT_GREY, BG);
+        if (runs) draw(10, 15, completion, VGA_LIGHT_GREEN, BG);
 
-        draw(2, 18, "NHIT: circular convolution on Z/64. 64 INT4 taps, not a",
-             VGA_LIGHT_GREY, BG);
-        draw(2, 19, "4096-weight matmul. Trained INT4 taps, integer only.",
-             VGA_LIGHT_GREY, BG);
+        /* Model shape, read from the compiled-in weights rather than written
+         * into a string, so this line cannot drift from what actually runs. */
+        draw(2, 18, "JL_LM:", VGA_LIGHT_GREY, BG);
+        if (!lm_ok) {
+            draw(9, 18, "SELFTEST FAILED - weight header disagrees with nhit.h",
+                 VGA_LIGHT_RED, BG);
+        } else {
+            size_t n = 0;
+            n = utoa(jl_lm_taps(), buf);
+            draw(9, 18, buf, VGA_YELLOW, BG);
+            draw(9 + n, 18, " taps, grouped NHIT, INT4, integer only",
+                 VGA_LIGHT_GREY, BG);
+            draw(2, 19, "gen cycles", VGA_LIGHT_GREY, BG);
+            utoa(lm_cycles, buf);
+            draw(14, 19, buf, VGA_LIGHT_GREEN, BG);
+            draw(30, 19, "MACs/char", VGA_LIGHT_GREY, BG);
+            utoa(jl_lm_macs(), buf);
+            draw(41, 19, buf, VGA_LIGHT_GREEN, BG);
+        }
 
         draw(2, 24, "JL/OS :: own bootloader :: own ISO :: 0xB8000 :: ps/2 0x60",
              VGA_DARK_GREY, BG);

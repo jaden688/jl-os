@@ -61,9 +61,9 @@ LDFLAGS := $(LDEMU) -T linker.ld -nostdlib -z noexecstack
 # failing unpredictably on other machines.
 LIBGCC := $(shell $(CC) $(ARCHFLAG) -print-libgcc-file-name 2>/dev/null)
 
-OBJS := boot.o kmain.o idt.o idt_stubs.o pic_pit.o serial.o jl_hud.o nhit.o jl_core.o
+OBJS := boot.o kmain.o idt.o idt_stubs.o pic_pit.o serial.o jl_hud.o nhit.o jl_core.o jl_lm.o
 
-.PHONY: all kernel iso run run-nographic debug verify clean toolchain-info stage1
+.PHONY: all kernel iso run run-nographic debug verify clean toolchain-info stage1 lmtest
 
 all: iso
 
@@ -85,7 +85,7 @@ idt.o: idt.c idt.h serial.h jl_core.h
 pic_pit.o: pic_pit.c pic_pit.h idt.h serial.h jl_core.h
 	$(CC) $(CFLAGS) -c pic_pit.c -o pic_pit.o
 
-kmain.o: kmain.c jl_core.h serial.h idt.h pic_pit.h
+kmain.o: kmain.c jl_core.h serial.h idt.h pic_pit.h jl_lm.h
 	$(CC) $(CFLAGS) -c kmain.c -o kmain.o
 
 serial.o: serial.c serial.h jl_core.h
@@ -96,6 +96,23 @@ jl_hud.o: jl_hud.c jl_core.h nhit.h nhit_weights.h pic_pit.h
 
 nhit.o: nhit.c nhit.h jl_core.h
 	$(CC) $(CFLAGS) -c nhit.c -o nhit.o
+
+jl_lm.o: jl_lm.c jl_lm.h nhit.h nhit_weights_mh.h jl_core.h
+	$(CC) $(CFLAGS) -c jl_lm.c -o jl_lm.o
+
+# Host harness: builds the REAL nhit.c and jl_lm.c against a host main so the
+# integer path can be scored on the same validation windows PyTorch used. This
+# is a measurement tool, not part of the kernel -- it is deliberately not in
+# OBJS and links host stdio, which kernel code may never do.
+#
+# Built at the host's native width, not -m32: the kernel is 32-bit, but every
+# value on this path is int8_t/int32_t and the arithmetic is bit-identical at
+# either width, so the accuracy measured here is the accuracy the kernel gets.
+# Cycle counts would NOT transfer, and this harness does not report any.
+lmtest: test_lm_host.c nhit.c jl_lm.c nhit_weights_mh.h
+	$(CC) -DJL_HOST -std=gnu11 -O2 -Wall -Wextra \
+	  test_lm_host.c nhit.c jl_lm.c -o test_lm_host
+	./test_lm_host lm_valset.bin
 
 jl_core.o: jl_core.c jl_core.h
 	$(CC) $(CFLAGS) -c jl_core.c -o jl_core.o

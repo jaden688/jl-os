@@ -8,6 +8,18 @@
 #ifndef JL_CORE_H
 #define JL_CORE_H
 
+/* The kernel has no libc, so it defines its own fixed-width types. A HOST build
+ * (test_lm_host.c) compiles these same sources against real headers to measure
+ * the integer path, and there these typedefs would collide with the platform's
+ * own -- size_t in particular is 64-bit on a 64-bit host. Deferring to
+ * <stdint.h> under JL_HOST is what lets the harness score the ACTUAL kernel
+ * code rather than a reimplementation of it.
+ *
+ * Kernel builds never define JL_HOST and are unaffected. */
+#ifdef JL_HOST
+#include <stdint.h>
+#include <stddef.h>
+#else
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
 typedef unsigned int       uint32_t;
@@ -17,6 +29,7 @@ typedef signed short       int16_t;
 typedef signed int         int32_t;
 typedef signed long long   int64_t;
 typedef uint32_t           size_t;
+#endif
 
 #ifndef NULL
 #define NULL ((void*)0)
