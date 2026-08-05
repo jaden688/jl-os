@@ -5,6 +5,7 @@
 #include "pewter.h"
 #include "ata.h"
 #include "serial.h"
+#include "kheap.h"
 
 #define SECTORS_PER_BLOCK (PEWTER_BLOCK / ATA_SECTOR_SIZE)   /* 8 */
 
@@ -15,6 +16,10 @@ static int mounted = 0;
  * stack and a quarter of a task stack, and a filesystem read must not be the
  * thing that overflows either. */
 static uint8_t blockbuf[PEWTER_BLOCK];
+
+/* Allocation bitmap, cached in memory for the life of the mount. See the
+ * commentary above bitmap_test for why this is not read from disk per query. */
+static uint8_t *bitmap = 0;
 
 uint32_t pewter_hash(const void *data, uint32_t len) {
     /* FNV-1a. Chosen because the host tool must reproduce it exactly and this
@@ -82,6 +87,19 @@ int pewter_mount(void) {
 
     for (uint32_t i = 0; i < sizeof(PewterSuper); i++)
         ((uint8_t *)&sb)[i] = blockbuf[i];
+
+    bitmap = (uint8_t *)kmalloc(sb.bitmap_blocks * PEWTER_BLOCK);
+    if (!bitmap) {
+        serial_write("[pewter] cannot allocate bitmap cache -- mount refused\n");
+        return 0;
+    }
+    for (uint32_t b = 0; b < sb.bitmap_blocks; b++) {
+        if (!read_block(sb.bitmap_start + b, bitmap + b * PEWTER_BLOCK)) {
+            serial_write("[pewter] bitmap read failed -- mount refused\n");
+            kfree(bitmap); bitmap = 0;
+            return 0;
+        }
+    }
     mounted = 1;
 
     /* Computed BEFORE taking the lock: the free-space scan reads the whole
@@ -166,21 +184,37 @@ uint32_t pewter_read(const char *name, void *buf, uint32_t max) {
 
 /* --- allocation ---------------------------------------------------------- */
 
+/* The bitmap is CACHED in memory for the life of the mount.
+ *
+ * The first implementation read the containing block from disk on every single
+ * bit query, which made find_extent do one 4 KiB disk read per candidate block
+ * -- thousands of reads to scan a 32 MiB volume, slow enough that a write never
+ * finished inside a 25-second boot. Scanning an allocation bitmap is inherently
+ * a per-bit operation, so the fix is to stop going to the disk for it, not to
+ * scan more cleverly.
+ *
+ * A 32 MiB volume needs 1 KiB of bitmap; 4 GiB would need 128 KiB. Allocated
+ * from the kernel heap, which is why this could not have been done before
+ * rung 9. */
+
 static int bitmap_test(uint32_t block) {
-    uint32_t bit = block;
-    uint32_t byte = bit / 8;
-    uint32_t blk = sb.bitmap_start + byte / PEWTER_BLOCK;
-    if (!read_block(blk, blockbuf)) return 1;      /* unreadable = treat as used */
-    return (blockbuf[byte % PEWTER_BLOCK] >> (bit % 8)) & 1u;
+    if (!bitmap) return 1;                         /* no cache = treat as used */
+    return (bitmap[block / 8] >> (block % 8)) & 1u;
 }
 
+/* Set bits in the cache, then flush only the blocks the change touched. */
 static int bitmap_mark(uint32_t start, uint32_t count) {
-    for (uint32_t b = start; b < start + count; b++) {
-        uint32_t byte = b / 8;
-        uint32_t blk = sb.bitmap_start + byte / PEWTER_BLOCK;
-        if (!read_block(blk, blockbuf)) return 0;
-        blockbuf[byte % PEWTER_BLOCK] |= (uint8_t)(1u << (b % 8));
-        if (!write_block(blk, blockbuf)) return 0;
+    if (!bitmap) return 0;
+    uint32_t first_byte = start / 8;
+    uint32_t last_byte = (start + count - 1) / 8;
+
+    for (uint32_t b = start; b < start + count; b++)
+        bitmap[b / 8] |= (uint8_t)(1u << (b % 8));
+
+    for (uint32_t blk = first_byte / PEWTER_BLOCK;
+         blk <= last_byte / PEWTER_BLOCK; blk++) {
+        if (!write_block(sb.bitmap_start + blk, bitmap + blk * PEWTER_BLOCK))
+            return 0;
     }
     return 1;
 }

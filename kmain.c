@@ -276,6 +276,33 @@ void kmain(uint32_t magic, const void *mb_info) {
             } else if (n) {
                 serial_write("[nhit]  blob rejected -- shape does not match\n");
             }
+            /* Exercise the write path. It was implemented alongside the read
+             * path and never run, and an untested allocator that reports
+             * success is worse than one that is absent.
+             *
+             * Written only once: the volume persists across boots, so an
+             * unconditional write would consume a fresh extent and a directory
+             * slot on every run until the volume filled. */
+            if (!pewter_find("/var/boot.ok")) {
+                static const char stamp[] =
+                    "PEWTER-FS write path verified in ring 0.\n";
+                uint32_t w = pewter_write("/var/boot.ok", stamp, sizeof(stamp));
+                if (w) {
+                    /* Read it BACK, which re-verifies the checksum through the
+                     * normal read path. A write that reports success but
+                     * cannot be read is the failure worth catching. */
+                    static char back[64];
+                    uint32_t r = pewter_read("/var/boot.ok", back, sizeof(back));
+                    if (r == w) serial_stage("PEWTER write verified by read-back");
+                    else serial_write("[pewter] WRITE SUCCEEDED BUT READ-BACK FAILED\n");
+                } else {
+                    serial_write("[pewter] write path failed\n");
+                }
+            } else {
+                serial_write("[pewter] /var/boot.ok present from a previous boot"
+                             " -- writes persist\n");
+            }
+
             serial_stage("PEWTER-FS mounted");
         }
     }
