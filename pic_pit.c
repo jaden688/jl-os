@@ -7,6 +7,7 @@
 #include "pic_pit.h"
 #include "idt.h"
 #include "serial.h"
+#include "task.h"
 
 static volatile uint64_t g_timer_ticks = 0;
 
@@ -80,6 +81,9 @@ void pic_pit_init(void) {
 
 void irq0_timer_c_handler(void) {
     g_timer_ticks++;
+    /* Preemption happens at the END of this function, after the EOI. Switching
+     * before the EOI would leave IRQ0 masked in the PIC for as long as the
+     * incoming task runs, and the timer would fire exactly once more, ever. */
 
     /* Send End-of-Interrupt (EOI) to Master PIC */
     outb(PIC1_COMMAND, 0x20);
@@ -92,6 +96,10 @@ void irq0_timer_c_handler(void) {
         serial_dec((uint32_t)(g_timer_ticks / 100));
         serial_write("s)\n");
     }
+
+    /* Last thing in the handler. sched_tick may not return until this task is
+     * scheduled again -- possibly seconds later -- so nothing may follow it. */
+    sched_tick();
 }
 
 uint64_t timer_get_ticks(void) {

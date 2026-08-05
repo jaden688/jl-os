@@ -15,6 +15,38 @@
 #include "idt.h"
 #include "pic_pit.h"
 #include "jl_lm.h"
+#include "pmm.h"
+#include "vmm.h"
+#include "kheap.h"
+#include "task.h"
+
+/* Two workers, so preemption is demonstrated rather than asserted. Neither
+ * calls sched_yield: if these interleave in the log, the PIT took the CPU away
+ * from a task that never gave it up. A cooperative scheduler cannot produce
+ * this output. */
+static volatile uint32_t worker_a_loops = 0;
+static volatile uint32_t worker_b_loops = 0;
+
+static void worker_a(void) {
+    for (uint32_t i = 0; i < 3; i++) {
+        /* Busy work, deliberately: a sleep would yield and prove nothing. */
+        for (volatile uint32_t d = 0; d < 8000000u; d++) { }
+        worker_a_loops++;
+        serial_write("[task]   worker-a slice ");
+        serial_dec(worker_a_loops);
+        serial_write("\n");
+    }
+}
+
+static void worker_b(void) {
+    for (uint32_t i = 0; i < 3; i++) {
+        for (volatile uint32_t d = 0; d < 8000000u; d++) { }
+        worker_b_loops++;
+        serial_write("[task]   worker-b slice ");
+        serial_dec(worker_b_loops);
+        serial_write("\n");
+    }
+}
 
 /* Local to this file: jl_hud.c has its own, and a shared one would mean an
  * extra translation unit for two instructions. */
@@ -161,6 +193,33 @@ void kmain(uint32_t magic, const void *mb_info) {
     boot_line("[jl]   MK-1 tensor/NHIT ring engine    : online\n", green_col);
     boot_line("[jl]   MK-2 scheduler descriptors      : online (simulated)\n", green_col);
     boot_line("[jl]   MK-3 IPC ring bus               : online\n", green_col);
+
+    /* Physical memory. Nothing above this could allocate before now -- the
+     * model is static in .bss for exactly that reason. */
+    pmm_init(mb_info);
+    serial_stage("physical memory manager online");
+
+    /* Rung 8. Identity map, so every physical pointer already in flight -- the
+     * model in .rodata, the VGA buffer, the E820 map -- stays valid across the
+     * instant CR0.PG is set. */
+    if (vmm_init()) serial_stage("paging enabled (CR0.PG)");
+
+    /* Rung 9. First dynamic memory in the kernel's life. */
+    if (kheap_selftest()) {
+        serial_write("[heap] selftest passed (alloc/free/reuse/coalesce), ");
+        serial_dec(kheap_bytes() / 1024);
+        serial_write(" KiB backed\n");
+        serial_stage("kernel heap online");
+    } else {
+        serial_write("[heap] SELFTEST FAILED -- heap not trustworthy\n");
+    }
+
+    /* Rung 10. This replaces the simulated MK-2 scheduler. */
+    sched_init();
+    task_spawn("worker-a", worker_a);
+    task_spawn("worker-b", worker_b);
+    sched_enable_preemption();
+    serial_stage("preemptive scheduler online (MK-2 is no longer simulated)");
 
     /* Run the model once at boot and report over COM1. The HUD shows inference
      * on VGA, but that needs a keypress and cannot be captured headlessly --

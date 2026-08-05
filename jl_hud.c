@@ -20,6 +20,7 @@
 #include "nhit_weights.h"
 #include "jl_lm.h"
 #include "pic_pit.h"
+#include "task.h"
 
 /* ------------------------------------------------------------------ ports -- */
 
@@ -347,16 +348,24 @@ void jl_hud_main(void) {
         size_t ulen = draw(52, 0, buf, VGA_YELLOW, BG);
         draw(52 + ulen, 0, "s", VGA_YELLOW, BG);
 
-        draw_box(1, 2, 46, 9, " MICROKERNELS ", VGA_LIGHT_CYAN, BG);
-        static const char *names[3] = {
-            "MK-1 NHIT ring     ", "MK-2 scheduler(sim)", "MK-3 synapse IPC   "};
+        draw_box(1, 2, 46, 9, " TASKS (preemptive) ", VGA_LIGHT_CYAN, BG);
+        /* Real tasks, read from the scheduler. This panel used to show three
+         * hardcoded names with a made-up load bar, including "MK-2
+         * scheduler(sim)" -- there is now an actual scheduler to report, so
+         * the row count, names and slice counts all come from it. */
         for (uint32_t i = 0; i < 3; i++) {
-            /* Load is derived from measured work, not invented. */
-            uint32_t pct = runs ? (uint32_t)((last_cycles >> (3 + i)) % 100u) : 0u;
-            draw(3, 4 + i * 2, names[i], VGA_WHITE, BG);
+            Task *t = sched_task_at(i);
+            if (!t) break;
+            draw(3, 4 + i * 2, t->name, VGA_WHITE, BG);
+            /* Share of all context switches this task received -- measured, not
+             * a decorative animation. */
+            uint32_t sw = sched_switches();
+            uint32_t pct = sw ? (t->slices * 100u) / sw : 0u;
+            if (pct > 100u) pct = 100u;
             bar(23, 4 + i * 2, 20, pct, BG);
-            utoa(pct, buf);
-            draw(44, 4 + i * 2, buf, VGA_YELLOW, BG);
+            utoa(t->slices, buf);
+            draw(44, 4 + i * 2, buf,
+                 t->state == TASK_DONE ? VGA_DARK_GREY : VGA_YELLOW, BG);
         }
 
         draw_box(48, 2, 31, 9, " MEASURED ", VGA_LIGHT_CYAN, BG);

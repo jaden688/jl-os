@@ -61,7 +61,7 @@ LDFLAGS := $(LDEMU) -T linker.ld -nostdlib -z noexecstack
 # failing unpredictably on other machines.
 LIBGCC := $(shell $(CC) $(ARCHFLAG) -print-libgcc-file-name 2>/dev/null)
 
-OBJS := boot.o kmain.o idt.o idt_stubs.o pic_pit.o serial.o jl_hud.o nhit.o jl_core.o jl_lm.o
+OBJS := boot.o kmain.o idt.o idt_stubs.o pic_pit.o serial.o jl_hud.o nhit.o jl_core.o jl_lm.o pmm.o vmm.o kheap.o task.o switch.o
 
 .PHONY: all kernel iso run run-nographic debug verify clean toolchain-info stage1 lmtest
 
@@ -82,16 +82,16 @@ idt_stubs.o: idt_stubs.s
 idt.o: idt.c idt.h serial.h jl_core.h
 	$(CC) $(CFLAGS) -c idt.c -o idt.o
 
-pic_pit.o: pic_pit.c pic_pit.h idt.h serial.h jl_core.h
+pic_pit.o: pic_pit.c pic_pit.h idt.h serial.h jl_core.h task.h
 	$(CC) $(CFLAGS) -c pic_pit.c -o pic_pit.o
 
-kmain.o: kmain.c jl_core.h serial.h idt.h pic_pit.h jl_lm.h
+kmain.o: kmain.c jl_core.h serial.h idt.h pic_pit.h jl_lm.h pmm.h vmm.h kheap.h task.h
 	$(CC) $(CFLAGS) -c kmain.c -o kmain.o
 
 serial.o: serial.c serial.h jl_core.h
 	$(CC) $(CFLAGS) -c serial.c -o serial.o
 
-jl_hud.o: jl_hud.c jl_core.h nhit.h nhit_weights.h pic_pit.h
+jl_hud.o: jl_hud.c jl_core.h nhit.h nhit_weights.h pic_pit.h jl_lm.h task.h
 	$(CC) $(CFLAGS) -c jl_hud.c -o jl_hud.o
 
 nhit.o: nhit.c nhit.h jl_core.h
@@ -99,6 +99,21 @@ nhit.o: nhit.c nhit.h jl_core.h
 
 jl_lm.o: jl_lm.c jl_lm.h nhit.h nhit_weights_mh.h jl_core.h
 	$(CC) $(CFLAGS) -c jl_lm.c -o jl_lm.o
+
+pmm.o: pmm.c pmm.h jl_core.h serial.h
+	$(CC) $(CFLAGS) -c pmm.c -o pmm.o
+
+vmm.o: vmm.c vmm.h pmm.h jl_core.h serial.h
+	$(CC) $(CFLAGS) -c vmm.c -o vmm.o
+
+kheap.o: kheap.c kheap.h pmm.h vmm.h jl_core.h serial.h
+	$(CC) $(CFLAGS) -c kheap.c -o kheap.o
+
+task.o: task.c task.h kheap.h jl_core.h serial.h
+	$(CC) $(CFLAGS) -c task.c -o task.o
+
+switch.o: switch.s
+	$(AS) $(ASFLAGS) switch.s -o switch.o
 
 # Host harness: builds the REAL nhit.c and jl_lm.c against a host main so the
 # integer path can be scored on the same validation windows PyTorch used. This

@@ -36,6 +36,14 @@
 .set KERNEL_DEST, 0x100000
 .set KERNEL_ENTRY,0x101000      /* _start; .multiboot occupies 0x100000 */
 
+/* E820 memory map, built here and handed to the kernel in Multiboot format.
+ * Lives at 0x9000: above this bootloader (0x7C00 + 2 KiB) and below the kernel
+ * staging buffer at 0x10000, so neither the disk read nor the relocation to
+ * 1 MiB can touch it. 32 entries is far more than any real machine reports. */
+.set MMAP_BUF,    0x9000
+.set MMAP_MAX,    32
+.set MMAP_END,    MMAP_BUF + MMAP_MAX * 24
+
 _boot_start:
     cli
     xorw    %ax, %ax
@@ -98,6 +106,19 @@ read_loop:
 
 read_done:
     movw    $msg_loaded, %si
+    call    print_string
+
+    /* ---- memory map (INT 15h, EAX=E820) -------------------------------- */
+    /* This MUST happen here, in real mode. Once the CPU is in protected mode
+     * the BIOS is unreachable, and the kernel has no other way to learn what
+     * physical memory exists. GRUB would have supplied this; we replaced GRUB,
+     * so we supply it.
+     *
+     * Written directly in Multiboot 1 mmap layout -- a 4-byte size field
+     * followed by the 20-byte E820 entry -- so the kernel parses one format
+     * whether it was booted by us or by a Multiboot loader. */
+    call    detect_memory
+    movw    $msg_mmap, %si
     call    print_string
 
     /* ---- A20 ---------------------------------------------------------- */
@@ -199,9 +220,97 @@ boot_drive:
  * honest: we do not yet supply a memory map. The kernel only requires the
  * pointer to be non-NULL. */
 .align 8
+/* Multiboot 1 information structure. Field offsets are fixed by the spec:
+ * flags +0, mem_lower +4, mem_upper +8, mmap_length +44, mmap_addr +48.
+ * detect_memory fills the mmap fields and sets flag bit 6. */
 mb_info:
-    .long   0                   /* flags */
-    .space  84, 0               /* remainder of the structure, zeroed */
+mb_flags:
+    .long   0                   /* bit 0 = mem_*, bit 6 = mmap valid */
+mb_mem_lower:
+    .long   0                   /* KiB below 1 MiB */
+mb_mem_upper:
+    .long   0                   /* KiB above 1 MiB */
+    .space  32, 0               /* boot_device, cmdline, mods, syms (+12..+43) */
+mb_mmap_length:
+    .long   0                   /* +44 */
+mb_mmap_addr:
+    .long   0                   /* +48 */
+    .space  36, 0               /* remainder (+52..+87), zeroed */
+
+/* ---- detect_memory ------------------------------------------------------
+ * Builds the Multiboot memory map at MMAP_BUF using INT 15h AX=E820.
+ *
+ * The E820 protocol is stateful: EBX carries the continuation value and is
+ * zero on the first call and again after the last entry. A BIOS may also
+ * signal the end by setting CF instead of clearing EBX, so both are checked --
+ * relying on only one is a known way to read one entry too many.
+ * ------------------------------------------------------------------------- */
+/* MUST be .code16. This routine sits below the .code32 directive that covers
+ * the protected-mode entry, but it RUNS in real mode, before the switch.
+ * Without this the assembler emits 32-bit encodings with operand-size prefixes
+ * and the CPU decodes a completely different instruction stream -- `movw
+ * $0x9000, %di` becomes a 32-bit load that swallows the next instruction as
+ * immediate data. The result assembles and links cleanly and then hangs. */
+.code16
+detect_memory:
+    pushal
+    movw    $MMAP_BUF, %di
+    xorl    %ebx, %ebx
+    xorl    %ebp, %ebp          /* entry count */
+
+e820_next:
+    movl    $20, %es:(%di)      /* Multiboot size field precedes the entry */
+    addw    $4, %di
+
+    movl    $0x0000E820, %eax
+    movl    $0x534D4150, %edx   /* 'SMAP' */
+    movl    $20, %ecx
+    int     $0x15
+    jc      e820_done           /* CF on the first call means E820 unsupported */
+    cmpl    $0x534D4150, %eax   /* BIOS echoes 'SMAP' on success */
+    jne     e820_done
+
+    /* A length of zero is a legal but useless entry; skip it rather than hand
+     * the allocator a zero-sized region. */
+    movl    %es:8(%di), %eax
+    orl     %es:12(%di), %eax
+    jz      e820_skip
+
+    incl    %ebp
+    addw    $20, %di
+    jmp     e820_test
+
+e820_skip:
+    subw    $4, %di             /* reuse this slot for the next entry */
+
+e820_test:
+    testl   %ebx, %ebx          /* zero continuation = that was the last one */
+    jz      e820_done
+    cmpw    $MMAP_END, %di
+    jb      e820_next
+
+e820_done:
+    /* mmap_length is the total byte count including the size fields. */
+    movl    %ebp, %eax
+    movl    $24, %edx
+    mull    %edx
+    movl    %eax, mb_mmap_length
+    movl    $MMAP_BUF, %eax
+    movl    %eax, mb_mmap_addr
+
+    testl   %ebp, %ebp
+    jz      1f
+    orl     $0x40, mb_flags     /* bit 6: mmap_* are valid */
+1:
+    /* INT 12h reports conventional memory in KiB. Cheap, always present, and
+     * it lets the kernel sanity-check the low end of the E820 map. */
+    int     $0x12
+    andl    $0xFFFF, %eax
+    movl    %eax, mb_mem_lower
+    orl     $0x01, mb_flags     /* bit 0: mem_lower/mem_upper valid */
+
+    popal
+    ret
 
 /* Flat GDT: identity-mapped 4 GiB code and data. No paging, no segmentation
  * tricks -- protected mode simply so we can address memory above 1 MiB. */
@@ -217,7 +326,8 @@ gdt_descriptor:
     .long   gdt_start
 
 msg_stage1:   .asciz "JL/OS stage1: reading kernel\r\n"
-msg_loaded:   .asciz "JL/OS stage1: kernel loaded, entering protected mode\r\n"
+msg_loaded:   .asciz "JL/OS stage1: kernel loaded\r\n"
+msg_mmap:     .asciz "JL/OS stage1: E820 map built, entering protected mode\r\n"
 msg_disk_err: .asciz "JL/OS stage1: INT 13h read failed\r\n"
 
 /* El Torito no-emulation loads whole 2048-byte sectors. Pad so the image is
