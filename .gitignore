@@ -19,3 +19,7 @@ test_lm_host
 boot_serial.log
 corpus_frozen.txt
 nhit_weights_mh.h
+.known_good/
+__pycache__/
+serial.log
+*.pyc

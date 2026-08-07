@@ -61,9 +61,9 @@ LDFLAGS := $(LDEMU) -T linker.ld -nostdlib -z noexecstack
 # failing unpredictably on other machines.
 LIBGCC := $(shell $(CC) $(ARCHFLAG) -print-libgcc-file-name 2>/dev/null)
 
-OBJS := boot.o kmain.o idt.o idt_stubs.o pic_pit.o serial.o jl_hud.o nhit.o jl_core.o jl_lm.o pmm.o vmm.o kheap.o task.o switch.o
+OBJS := boot.o kmain.o idt.o idt_stubs.o pic_pit.o serial.o jl_hud.o nhit.o jl_core.o jl_lm.o pmm.o vmm.o kheap.o task.o switch.o ata.o pewter.o
 
-.PHONY: all kernel iso run run-nographic debug verify clean toolchain-info stage1 lmtest
+.PHONY: all kernel iso run run-nographic debug verify clean toolchain-info stage1 lmtest pewter
 
 all: iso
 
@@ -85,7 +85,7 @@ idt.o: idt.c idt.h serial.h jl_core.h
 pic_pit.o: pic_pit.c pic_pit.h idt.h serial.h jl_core.h task.h
 	$(CC) $(CFLAGS) -c pic_pit.c -o pic_pit.o
 
-kmain.o: kmain.c jl_core.h serial.h idt.h pic_pit.h jl_lm.h pmm.h vmm.h kheap.h task.h
+kmain.o: kmain.c jl_core.h serial.h idt.h pic_pit.h jl_lm.h pmm.h vmm.h kheap.h task.h ata.h pewter.h
 	$(CC) $(CFLAGS) -c kmain.c -o kmain.o
 
 serial.o: serial.c serial.h jl_core.h
@@ -97,7 +97,7 @@ jl_hud.o: jl_hud.c jl_core.h nhit.h nhit_weights.h pic_pit.h jl_lm.h task.h
 nhit.o: nhit.c nhit.h jl_core.h
 	$(CC) $(CFLAGS) -c nhit.c -o nhit.o
 
-jl_lm.o: jl_lm.c jl_lm.h nhit.h nhit_weights_mh.h jl_core.h
+jl_lm.o: jl_lm.c jl_lm.h nhit.h kheap.h jl_core.h
 	$(CC) $(CFLAGS) -c jl_lm.c -o jl_lm.o
 
 pmm.o: pmm.c pmm.h jl_core.h serial.h
@@ -115,6 +115,12 @@ task.o: task.c task.h kheap.h jl_core.h serial.h
 switch.o: switch.s
 	$(AS) $(ASFLAGS) switch.s -o switch.o
 
+ata.o: ata.c ata.h jl_core.h serial.h
+	$(CC) $(CFLAGS) -c ata.c -o ata.o
+
+pewter.o: pewter.c pewter.h ata.h kheap.h jl_core.h serial.h
+	$(CC) $(CFLAGS) -c pewter.c -o pewter.o
+
 # Host harness: builds the REAL nhit.c and jl_lm.c against a host main so the
 # integer path can be scored on the same validation windows PyTorch used. This
 # is a measurement tool, not part of the kernel -- it is deliberately not in
@@ -124,10 +130,10 @@ switch.o: switch.s
 # value on this path is int8_t/int32_t and the arithmetic is bit-identical at
 # either width, so the accuracy measured here is the accuracy the kernel gets.
 # Cycle counts would NOT transfer, and this harness does not report any.
-lmtest: test_lm_host.c nhit.c jl_lm.c nhit_weights_mh.h
+lmtest: test_lm_host.c nhit.c jl_lm.c core.nhit
 	$(CC) -DJL_HOST -std=gnu11 -O2 -Wall -Wextra \
 	  test_lm_host.c nhit.c jl_lm.c -o test_lm_host
-	./test_lm_host lm_valset.bin
+	./test_lm_host lm_valset.bin core.nhit
 
 jl_core.o: jl_core.c jl_core.h
 	$(CC) $(CFLAGS) -c jl_core.c -o jl_core.o
@@ -204,11 +210,24 @@ QEMU      := qemu-system-i386
 # -serial stdio           : COM1 to the terminal -- the authoritative evidence
 QEMUFLAGS := -m 256M -no-reboot -no-shutdown -serial stdio
 
-run: $(ISO)
-	$(QEMU) -cdrom $(ISO) $(QEMUFLAGS)
+PEWTER := pewter.img
 
-run-nographic: $(ISO)
-	$(QEMU) -cdrom $(ISO) -m 256M -no-reboot -no-shutdown -nographic
+# The volume is a separate artifact from the ISO on purpose: that separation IS
+# rung 14. Storage the kernel reaches at runtime, not payload baked into boot.
+pewter: $(PEWTER)
+
+$(PEWTER): mkpewter.py core.nhit motd.txt
+	$(PYTHON) mkpewter.py --out $(PEWTER) --size 32 	  --add /models/core.nhit=core.nhit --add /etc/motd=motd.txt
+
+# Primary master = the PEWTER volume; the boot CD lands on the secondary
+# channel, which is why ata_init rejects an ATAPI device on the primary.
+DISKFLAGS := -drive file=$(PEWTER),format=raw,if=ide,index=0,media=disk
+
+run: $(ISO) $(PEWTER)
+	$(QEMU) -cdrom $(ISO) $(DISKFLAGS) -boot d $(QEMUFLAGS)
+
+run-nographic: $(ISO) $(PEWTER)
+	$(QEMU) -cdrom $(ISO) $(DISKFLAGS) -boot d -m 256M -no-reboot -no-shutdown -nographic
 
 # Starts paused (-S) with a GDB stub on tcp::1234 (-s).
 debug: $(ISO)

@@ -253,8 +253,29 @@ void kmain(uint32_t magic, const void *mb_info) {
              * The blob is held in a static buffer for the life of the kernel
              * because jl_lm points into it rather than copying 171 KiB to own
              * a second time. */
-            static uint8_t blob[512 * 1024];
-            uint32_t n = pewter_read("/models/core.nhit", blob, sizeof(blob));
+            /* Sized from the DIRECTORY ENTRY, not a fixed array. A static
+             * buffer here silently caps the model at its own size -- the
+             * previous 512 KiB one made "bounded by the volume, not the boot
+             * image" false by a factor of 60, which is exactly the kind of
+             * ceiling that goes unnoticed until a model stops loading.
+             *
+             * Never freed: jl_lm points into this rather than copying, so it
+             * must outlive every prediction. */
+            const PewterEntry *me = pewter_find("/models/core.nhit");
+            /* Copied out immediately: pewter_find returns a pointer INTO the
+             * filesystem's shared block buffer, and pewter_read overwrites it. */
+            uint32_t msize = me ? me->size : 0;
+            uint32_t n = 0;
+            uint8_t *blob = 0;
+            if (msize) {
+                blob = (uint8_t *)kmalloc(msize);
+                if (blob) n = pewter_read("/models/core.nhit", blob, msize);
+                else {
+                    serial_write("[nhit]  cannot allocate ");
+                    serial_dec(msize);
+                    serial_write(" bytes for the model\n");
+                }
+            }
             if (n && jl_lm_load(blob, n)) {
                 uint32_t f = serial_lock();
                 serial_write("[nhit]  model loaded from /models/core.nhit (");
