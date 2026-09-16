@@ -1,5 +1,6 @@
 *.o
 *.bin
+*.exe
 *.flat
 *.iso
 test_lm_host
